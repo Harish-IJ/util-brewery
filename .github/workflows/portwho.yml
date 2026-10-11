@@ -1,0 +1,32 @@
+name: portwho
+
+on:
+  push:
+    paths: ["rust/portwho/**", ".github/workflows/portwho.yml"]
+  pull_request:
+    paths: ["rust/portwho/**", ".github/workflows/portwho.yml"]
+
+defaults:
+  run:
+    working-directory: rust/portwho
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is the target platform; Linux keeps the shared code honest.
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/portwho
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - run: cargo build --release && ls -l target/release/portwho

@@ -25,7 +25,9 @@
 
 ## Milestones
 
-1. **M1:** table of listening TCP ports with project or path, short command, bind, PID and uptime.
-2. **M2:** live refresh, CPU/memory (`phys_footprint` on macOS), sort and filter.
-3. **M3:** kill the whole process tree and verify the port is free; grey out root/other-user rows.
-4. **M4:** polish: bind badges, help bar, idle CPU budget.
+1. ✅ **M1:** table of listening TCP ports with project or path, short command, bind, PID and uptime.
+2. ✅ **M2:** live refresh (`-i`), CPU and memory (`phys_footprint` on macOS), sort (`s`/`S`) and filter (`/`, `:port`).
+3. ✅ **M3:** `x` stops the process tree (single-child wrappers, so siblings survive), SIGTERM → SIGKILL after 2 s, then verifies the port is free. Other-user, container-forwarder and own-terminal processes are refused.
+4. ✅ **M4:** colour-coded bind (`*` vs `localhost`), Docker/OrbStack/Colima/Podman labels, help overlay, idle budget (~1 MB binary, ~4 MB RSS, ~0 idle CPU).
+
+Tests: unit, TUI (`TestBackend`), CLI, and real-process kill tests. CI runs them on macOS and Linux.

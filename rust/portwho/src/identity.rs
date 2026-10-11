@@ -72,7 +72,7 @@ pub fn short_command(argv: &[String], fallback: &str) -> String {
     };
     let program = basename(first);
 
-    if RUNTIMES.contains(&program.as_str()) {
+    if is_runtime(&program) {
         let mut i = 0;
         while i < rest.len() {
             let arg = &rest[i];
@@ -115,6 +115,14 @@ fn script_label(script: &str) -> String {
     basename(script)
 }
 
+/// `node`, `Python`, `python3.12` → true. Versioned and capitalised builds
+/// (pyenv, the macOS framework Python) are still the same runtime.
+fn is_runtime(program: &str) -> bool {
+    let lower = program.to_ascii_lowercase();
+    let bare = lower.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    RUNTIMES.contains(&lower.as_str()) || RUNTIMES.contains(&bare)
+}
+
 fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
@@ -124,6 +132,39 @@ fn join(head: &str, tail: &[String]) -> String {
         .chain(tail.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Container runtimes publish ports through a host-side forwarder process.
+/// Naming the runtime beats showing `com.docker.backend`, and killing it would
+/// take down every container, so callers refuse to.
+pub fn forwarder(name: &str, exe: Option<&Path>, argv: &[String]) -> Option<&'static str> {
+    let exe = exe.map(|p| p.to_string_lossy()).unwrap_or_default();
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("com.docker") || lower == "vpnkit" || exe.contains("/Docker.app/") {
+        Some("Docker Desktop")
+    } else if lower == "docker-proxy" {
+        Some("Docker")
+    } else if lower.contains("orbstack") || exe.contains("/OrbStack.app/") {
+        Some("OrbStack")
+    } else if lower == "limactl"
+        || (lower == "ssh"
+            && argv
+                .iter()
+                .any(|a| a.contains(".lima") || a.contains("colima")))
+    {
+        Some("Lima/Colima")
+    } else if lower == "gvproxy" || lower.starts_with("podman") {
+        Some("Podman")
+    } else {
+        None
+    }
+}
+
+/// The first word of [`short_command`]: what the process *is* (`vite`, `npm`, `sh`).
+pub fn program(argv: &[String], fallback: &str) -> String {
+    let cmd = short_command(argv, fallback);
+    let word = cmd.split(' ').next().unwrap_or_default();
+    basename(word)
 }
 
 #[cfg(test)]
@@ -165,11 +206,56 @@ mod tests {
             ),
             ("bun run dev", "bun run dev"),
             ("python3 manage.py runserver", "manage.py runserver"),
+            ("/usr/local/bin/python3.12 app.py", "app.py"),
+            (
+                "/Library/Frameworks/Python.framework/Python -c pass",
+                "Python -c",
+            ),
         ];
         for (input, expected) in cases {
             assert_eq!(short_command(&argv(input), "x"), expected, "{input}");
         }
         assert_eq!(short_command(&[], "postgres"), "postgres");
+    }
+
+    #[test]
+    fn programs() {
+        assert_eq!(
+            program(&argv("node /a/node_modules/.bin/vite"), "node"),
+            "vite"
+        );
+        assert_eq!(program(&argv("/bin/sh -c vite"), "sh"), "sh");
+        assert_eq!(program(&[], "postgres"), "postgres");
+    }
+
+    #[test]
+    fn forwarders() {
+        let none: &[String] = &[];
+        let docker_exe = Path::new("/Applications/Docker.app/Contents/MacOS/com.docker.backend");
+        assert_eq!(
+            forwarder("com.docke", Some(docker_exe), none),
+            Some("Docker Desktop")
+        );
+        assert_eq!(
+            forwarder("com.docker.backend", None, none),
+            Some("Docker Desktop")
+        );
+        assert_eq!(forwarder("docker-proxy", None, none), Some("Docker"));
+        assert_eq!(forwarder("OrbStack Helper", None, none), Some("OrbStack"));
+        assert_eq!(
+            forwarder(
+                "ssh",
+                None,
+                &argv("ssh -F /Users/me/.lima/colima/ssh.config")
+            ),
+            Some("Lima/Colima")
+        );
+        assert_eq!(forwarder("ssh", None, &argv("ssh prod-box")), None);
+        assert_eq!(forwarder("gvproxy", None, none), Some("Podman"));
+        assert_eq!(
+            forwarder("node", Some(Path::new("/usr/bin/node")), none),
+            None
+        );
     }
 
     #[test]

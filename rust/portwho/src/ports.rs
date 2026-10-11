@@ -1,8 +1,8 @@
 //! Collects listening TCP sockets and enriches them with process details.
 //!
 //! `listeners` maps sockets → PIDs (libproc on macOS). `sysinfo` then fills in
-//! cwd / argv / uptime, but only for the handful of PIDs that own a listener,
-//! never for every process on the system.
+//! cwd / argv / CPU / uptime, but only for the handful of PIDs that own a
+//! listener, never for every process on the system.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -12,9 +12,10 @@ use listeners::{Protocol, SocketState};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::identity::{self, ProjectCache};
+use crate::mem;
 
 /// One row in the table: a process listening on a port (all of its binds merged).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PortEntry {
     pub port: u16,
     pub pid: u32,
@@ -26,14 +27,23 @@ pub struct PortEntry {
     pub cmd: Vec<String>,
     /// `package.json` name of the project the process runs in, if any.
     pub project: Option<String>,
+    /// Set when the listener is a container runtime forwarding a published port.
+    pub forwarder: Option<&'static str>,
     pub uptime_secs: Option<u64>,
+    /// Percent of one core; can exceed 100 for multi-threaded processes.
+    pub cpu: f32,
+    /// Activity Monitor's "Memory" (`phys_footprint`) on macOS, RSS elsewhere.
+    pub mem_bytes: Option<u64>,
     /// False for root / other-user processes, which we can't inspect or kill.
     pub owned_by_me: bool,
 }
 
 impl PortEntry {
-    /// What the PROJECT column shows: package name, else the shortened cwd, else the exe.
+    /// What the PROJECT column shows: container runtime, package name, shortened cwd, or exe.
     pub fn label(&self) -> String {
+        if let Some(fwd) = self.forwarder {
+            return format!("{fwd} (container)");
+        }
         if let Some(project) = &self.project {
             return project.clone();
         }
@@ -50,36 +60,96 @@ impl PortEntry {
         identity::short_command(&self.cmd, &self.name)
     }
 
-    pub fn bind_label(&self) -> String {
-        bind_label(&self.binds)
+    pub fn bind(&self) -> Bind {
+        Bind::of(&self.binds)
     }
 }
 
-/// Summarises a set of bind addresses: `*` (all interfaces), `localhost`, or the IP,
-/// followed by the IP families in use.
-pub fn bind_label(binds: &[IpAddr]) -> String {
-    let host = if binds.iter().any(IpAddr::is_unspecified) {
-        "*".to_string()
-    } else if binds.iter().all(is_loopback) {
-        "localhost".to_string()
-    } else {
-        binds
-            .iter()
-            .find(|ip| !is_loopback(ip))
-            .map_or_else(String::new, ToString::to_string)
-    };
-    let v4 = binds.iter().any(|ip| ip.to_canonical().is_ipv4());
-    let v6 = binds.iter().any(|ip| ip.to_canonical().is_ipv6());
-    let family = match (v4, v6) {
-        (true, true) => "v4+v6",
-        (true, false) => "v4",
-        _ => "v6",
-    };
-    format!("{host} {family}")
+/// Where a port is reachable from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Bound to a wildcard address: reachable from the network.
+    All,
+    Localhost,
+    Specific,
 }
 
-fn is_loopback(ip: &IpAddr) -> bool {
-    ip.to_canonical().is_loopback()
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bind {
+    pub scope: Scope,
+    /// `*`, `localhost`, or the specific IP.
+    pub host: String,
+    /// `v4`, `v6`, or `v4+v6`.
+    pub family: &'static str,
+}
+
+impl Bind {
+    pub fn of(binds: &[IpAddr]) -> Self {
+        let canon: Vec<IpAddr> = binds.iter().map(IpAddr::to_canonical).collect();
+        let (scope, host) = if canon.iter().any(IpAddr::is_unspecified) {
+            (Scope::All, "*".to_string())
+        } else if canon.iter().all(IpAddr::is_loopback) {
+            (Scope::Localhost, "localhost".to_string())
+        } else {
+            let ip = canon.iter().find(|ip| !ip.is_loopback());
+            (
+                Scope::Specific,
+                ip.map_or_else(String::new, ToString::to_string),
+            )
+        };
+        let v4 = canon.iter().any(IpAddr::is_ipv4);
+        let v6 = canon.iter().any(IpAddr::is_ipv6);
+        let family = match (v4, v6) {
+            (true, true) => "v4+v6",
+            (true, false) => "v4",
+            _ => "v6",
+        };
+        Self {
+            scope,
+            host,
+            family,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        format!("{} {}", self.host, self.family)
+    }
+}
+
+/// A raw listening TCP socket: `(port, pid, process name, bound IP)`.
+pub type RawSocket = (u16, u32, String, IpAddr);
+
+/// Groups sockets by `(port, pid)` so a dual-stack server is a single row.
+pub fn group_sockets(
+    sockets: impl IntoIterator<Item = RawSocket>,
+) -> BTreeMap<(u16, u32), (String, Vec<IpAddr>)> {
+    let mut grouped: BTreeMap<(u16, u32), (String, Vec<IpAddr>)> = BTreeMap::new();
+    for (port, pid, name, ip) in sockets {
+        let entry = grouped
+            .entry((port, pid))
+            .or_insert_with(|| (name, Vec::new()));
+        if !entry.1.contains(&ip) {
+            entry.1.push(ip);
+        }
+    }
+    grouped
+}
+
+/// Every listening TCP socket on the machine that we're allowed to see.
+pub fn listening_sockets() -> Result<Vec<RawSocket>, String> {
+    let all = listeners::get_all().map_err(|e| e.to_string())?;
+    Ok(all
+        .into_iter()
+        .filter(|l| l.protocol == Protocol::TCP && l.state == SocketState::Listen)
+        .map(|l| {
+            (
+                l.socket.port(),
+                l.process.pid,
+                l.process.name,
+                l.socket.ip(),
+            )
+        })
+        .collect())
 }
 
 /// Owns the long-lived state needed between refreshes (sysinfo's process table, caches).
@@ -89,81 +159,91 @@ pub struct Collector {
     my_uid: u32,
 }
 
+impl Default for Collector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Collector {
     pub fn new() -> Self {
         Self {
             sys: System::new(),
             projects: ProjectCache::default(),
-            // SAFETY: getuid has no preconditions and cannot fail.
-            my_uid: unsafe { libc::getuid() },
+            my_uid: current_uid(),
         }
     }
 
     pub fn collect(&mut self) -> Result<Vec<PortEntry>, String> {
-        let all = listeners::get_all().map_err(|e| e.to_string())?;
+        let grouped = group_sockets(listening_sockets()?);
 
-        // Group sockets by (port, pid) so a dual-stack server is one row.
-        let mut grouped: BTreeMap<(u16, u32), (String, Vec<IpAddr>)> = BTreeMap::new();
-        for l in all {
-            if l.protocol != Protocol::TCP || l.state != SocketState::Listen {
-                continue;
-            }
-            let entry = grouped
-                .entry((l.socket.port(), l.process.pid))
-                .or_insert_with(|| (l.process.name.clone(), Vec::new()));
-            if !entry.1.contains(&l.socket.ip()) {
-                entry.1.push(l.socket.ip());
-            }
+        let mut pids: Vec<Pid> = grouped.keys().map(|(_, pid)| Pid::from_u32(*pid)).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        // sysinfo keeps every PID it was ever asked about. Start over once stale
+        // entries dominate so a long session doesn't grow (costs one CPU sample).
+        if self.sys.processes().len() > 2 * pids.len() + 32 {
+            self.sys = System::new();
         }
-
-        let pids: Vec<Pid> = {
-            let mut p: Vec<u32> = grouped.keys().map(|(_, pid)| *pid).collect();
-            p.sort_unstable();
-            p.dedup();
-            p.into_iter().map(Pid::from_u32).collect()
-        };
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&pids),
             true,
             ProcessRefreshKind::nothing()
+                .without_tasks()
+                .with_cpu()
+                .with_memory()
                 .with_cwd(UpdateKind::OnlyIfNotSet)
                 .with_cmd(UpdateKind::OnlyIfNotSet)
                 .with_exe(UpdateKind::OnlyIfNotSet)
                 .with_user(UpdateKind::OnlyIfNotSet),
         );
-
         let entries = grouped
             .into_iter()
             .map(|((port, pid), (name, binds))| {
                 let proc_ = self.sys.process(Pid::from_u32(pid));
                 let cwd = proc_.and_then(|p| p.cwd()).map(Path::to_path_buf);
-                let project = cwd.as_deref().and_then(|c| self.projects.lookup(c));
-                let owned_by_me = proc_
-                    .and_then(|p| p.user_id())
-                    .is_some_and(|uid| **uid == self.my_uid);
+                let exe = proc_.and_then(|p| p.exe()).map(Path::to_path_buf);
+                let cmd: Vec<String> = proc_
+                    .map(|p| {
+                        p.cmd()
+                            .iter()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let forwarder = identity::forwarder(&name, exe.as_deref(), &cmd);
+                let project = match (&forwarder, cwd.as_deref()) {
+                    (None, Some(c)) => self.projects.lookup(c),
+                    _ => None,
+                };
                 PortEntry {
                     port,
                     pid,
                     binds,
-                    name,
-                    exe: proc_.and_then(|p| p.exe()).map(Path::to_path_buf),
-                    cwd,
-                    cmd: proc_
-                        .map(|p| {
-                            p.cmd()
-                                .iter()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    project,
+                    owned_by_me: proc_
+                        .and_then(|p| p.user_id())
+                        .is_some_and(|uid| **uid == self.my_uid),
+                    cpu: proc_.map_or(0.0, sysinfo::Process::cpu_usage),
+                    mem_bytes: mem::footprint(pid)
+                        .or_else(|| proc_.map(sysinfo::Process::memory))
+                        .filter(|b| *b > 0),
                     uptime_secs: proc_.map(sysinfo::Process::run_time),
-                    owned_by_me,
+                    name,
+                    exe,
+                    cwd,
+                    cmd,
+                    project,
+                    forwarder,
                 }
             })
             .collect();
         Ok(entries)
     }
+}
+
+pub fn current_uid() -> u32 {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
 }
 
 #[cfg(test)]
@@ -176,10 +256,60 @@ mod tests {
 
     #[test]
     fn bind_labels() {
-        assert_eq!(bind_label(&ips(&["0.0.0.0", "::"])), "* v4+v6");
-        assert_eq!(bind_label(&ips(&["::1"])), "localhost v6");
-        assert_eq!(bind_label(&ips(&["127.0.0.1", "::1"])), "localhost v4+v6");
-        assert_eq!(bind_label(&ips(&["::ffff:127.0.0.1"])), "localhost v4");
-        assert_eq!(bind_label(&ips(&["192.168.1.5"])), "192.168.1.5 v4");
+        let cases = [
+            (&["0.0.0.0", "::"][..], Scope::All, "* v4+v6"),
+            (&["::1"], Scope::Localhost, "localhost v6"),
+            (&["127.0.0.1", "::1"], Scope::Localhost, "localhost v4+v6"),
+            (&["::ffff:127.0.0.1"], Scope::Localhost, "localhost v4"),
+            (&["::ffff:0.0.0.0"], Scope::All, "* v4"),
+            (&["192.168.1.5"], Scope::Specific, "192.168.1.5 v4"),
+            (&["127.0.0.1", "10.0.0.2"], Scope::Specific, "10.0.0.2 v4"),
+        ];
+        for (input, scope, label) in cases {
+            let bind = Bind::of(&ips(input));
+            assert_eq!(
+                (bind.scope, bind.label().as_str()),
+                (scope, label),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn groups_dual_stack_sockets_into_one_row() {
+        let sock = |port, pid, ip: &str| (port, pid, "node".to_string(), ip.parse().unwrap());
+        let grouped = group_sockets([
+            sock(3000, 10, "0.0.0.0"),
+            sock(3000, 10, "::"),
+            sock(3000, 10, "::"),
+            sock(3000, 11, "127.0.0.1"),
+            sock(5173, 10, "::1"),
+        ]);
+        let keys: Vec<_> = grouped.keys().copied().collect();
+        assert_eq!(keys, [(3000, 10), (3000, 11), (5173, 10)]);
+        assert_eq!(grouped[&(3000, 10)].1, ips(&["0.0.0.0", "::"]));
+    }
+
+    #[test]
+    fn label_priority() {
+        let mut e = PortEntry {
+            name: "node".into(),
+            exe: Some("/usr/bin/node".into()),
+            ..Default::default()
+        };
+        assert_eq!(e.label(), "/usr/bin/node");
+        e.cwd = Some("/".into());
+        assert_eq!(e.label(), "/usr/bin/node", "cwd `/` says nothing");
+        e.cwd = Some("/srv/api".into());
+        assert_eq!(e.label(), "/srv/api");
+        e.project = Some("acme-api".into());
+        assert_eq!(e.label(), "acme-api");
+        e.forwarder = Some("Docker Desktop");
+        assert_eq!(e.label(), "Docker Desktop (container)");
+        let bare = PortEntry {
+            name: "launchd".into(),
+            ..Default::default()
+        };
+        assert_eq!(bare.label(), "(launchd)");
     }
 }
